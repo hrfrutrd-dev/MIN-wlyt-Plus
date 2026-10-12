@@ -572,3 +572,95 @@ test('channel: 旧い channelMetadataRenderer でもアイコンと登録者数�
   assert.strictEqual(browses.length, 1, 'browse は1往復');
   assert.strictEqual(browses[0].body.browseId, 'UColdformatxxxxxxxxxxxxxx');
 });
+
+/* ------------------------------------------------------------------ 検索の修正 */
+
+test('search: 深いページ（page>=3）も継続トークンを辿って正しいページを返す', async () => {
+  // 旧実装は2ページまでしか辿らず、page>=3 で同じページを返し続けていた。
+  const pages = [
+    ['aaaaaaaaaaa', 'p0'], ['bbbbbbbbbbb', 'p1'], ['ccccccccccc', 'p2'], ['ddddddddddd', 'p3'],
+  ];
+  const tokens = { p0: TOKEN(1), p1: TOKEN(2), p2: TOKEN(3) };
+  const fetchImpl = makeFetch(async ({ body }) => {
+    if (body && body.continuation) {
+      const norm = normalizeContinuation(body.continuation);
+      const idx = Object.values(tokens).indexOf(norm);
+      if (idx === -1) throw new Error('unknown continuation');
+      const next = pages[idx + 1];
+      const cont = tokens['p' + (idx + 1)] || null;
+      return jsonRes(searchResponse([videoRenderer(next[0], next[1])], cont ? encodeURIComponent(cont) : null));
+    }
+    return jsonRes(searchResponse([videoRenderer(pages[0][0], pages[0][1])], encodeURIComponent(tokens.p0)));
+  });
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0 });
+
+  const p3 = await yt.search('テスト', { page: 3 });
+  assert.strictEqual(p3.items.length, 1);
+  assert.strictEqual(p3.items[0].id, 'ddddddddddd', 'page3 は4ページ目の内容');
+  assert.strictEqual(p3.items[0].title, 'p3');
+  // 2ページ目（ccccccccccc）を重複して返していない
+  assert.ok(!p3.items.some((i) => i.id === 'ccccccccccc'), '1つ前のページを返していない');
+});
+
+test('lockupViewModel: チャンネル名に「視聴」等が含まれても再生数・日付と取り違えない', () => {
+  const vm = {
+    lockupViewModel: {
+      contentId: 'fffffffffff',
+      contentType: 'VIDEO',
+      metadata: {
+        lockupMetadataViewModel: {
+          title: { content: 't' },
+          metadata: {
+            contentMetadataViewModel: {
+              metadataRows: [{
+                metadataParts: [
+                  // チャンネル名は avatar を持つ（新形式の安定した印）
+                  { text: { content: '視聴室チャンネル' }, avatar: { image: { sources: [{ url: 'https://yt3.ggpht.com/ytc/x=s88' }] } } },
+                  { text: { content: '1.2万回視聴' } },
+                  { text: { content: '1 週間前' } },
+                ],
+              }],
+            },
+          },
+        },
+      },
+    },
+  };
+  const { items } = extractItems([vm]);
+  assert.strictEqual(items.length, 1);
+  assert.strictEqual(items[0].channel, '視聴室チャンネル', 'チャンネル名は avatar 付き部品から取る');
+  assert.strictEqual(items[0].views, '1.2万回視聴', '再生数は別部品');
+  assert.strictEqual(items[0].published, '1 週間前', '投稿日は別部品');
+});
+
+test('lockupViewModel: avatar が無ければ従来どおり「視聴・日付以外」の部品をチャンネル名にする', () => {
+  const { items } = extractItems([lockup('ddddddddddd', 'no avatar', ['Ch D', '1.2万回視聴', '3 日前'], { avatar: false })]);
+  assert.strictEqual(items[0].channel, 'Ch D');
+  assert.strictEqual(items[0].views, '1.2万回視聴');
+  assert.strictEqual(items[0].published, '3 日前');
+});
+
+test('直接接続環境のタイムアウトは拒否として数え、早めに回路を開く', async () => {
+  // プロキシを一切使わず直接接続（fetchImpl.pool.direct = true）。
+  // タイムアウトは「サーバーIPがブロックされている」信号なので systemic に扱う。
+  const mkDirect = () => {
+    const f = async () => { throw new Error('The user aborted a request.'); };
+    f.pool = { direct: true };
+    return f;
+  };
+  const yt = new YtMetadata({ fetchImpl: mkDirect(), hedgeMs: 0, circuitThreshold: 3, transportThreshold: 99 });
+  for (let i = 0; i < 3; i++) await yt.search(`d${i}`).catch(() => {});
+  assert.strictEqual(yt.state().consecutiveFailures, 3, '拒否として数える');
+  assert.strictEqual(yt.state().transportFailures, 0, 'transport ではない');
+  assert.ok(yt.state().circuitOpen, '数回で回路が開く（毎検索何秒も待たせない）');
+});
+
+test('プロキシ利用中のタイムアウトは従来どおり transport（すぐには開かない）', async () => {
+  const f = async () => { throw new Error('The user aborted a request.'); };
+  f.pool = { direct: false };
+  const yt = new YtMetadata({ fetchImpl: f, hedgeMs: 0, circuitThreshold: 3, transportThreshold: 99 });
+  for (let i = 0; i < 3; i++) await yt.search(`p${i}`).catch(() => {});
+  assert.strictEqual(yt.state().transportFailures, 3, 'transport として数える');
+  assert.strictEqual(yt.state().consecutiveFailures, 0, '拒否としては数えない');
+  assert.strictEqual(yt.state().circuitOpen, false, 'すぐには開かない');
+});
