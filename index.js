@@ -125,15 +125,20 @@ function legacyDisabled() {
   return legacyIsDead() || !!(YT_META_ENABLED && ytMeta && ytMeta.isBlocked);
 }
 
-/** 従来経路で検索する。使えない/失敗なら空配列（落ちない）。 */
-async function legacySearch(q, limit = 20, page = 0) {
+/**
+ * 従来経路で検索する。使えない/失敗なら空配列（落ちない）。
+ * timeoutMs: 呼び出し側が「これ以上待てない」と定めているときの残りの予算。
+ * 指定がなければ LEGACY_TIMEOUT（環境変数で変更可）。
+ */
+async function legacySearch(q, limit = 20, page = 0, timeoutMs) {
   if (legacyDisabled()) return [];
+  const budget = timeoutMs > 0 ? Math.min(timeoutMs, LEGACY_TIMEOUT) : LEGACY_TIMEOUT;
   let timer;
   try {
     const results = await Promise.race([
       yts.GetListByKeyword(q, false, limit, page),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('legacy timeout')), LEGACY_TIMEOUT);
+        timer = setTimeout(() => reject(new Error('legacy timeout')), budget);
       }),
     ]);
     return normalizeYtsItems(results && results.items);
@@ -477,8 +482,12 @@ function normalizeYtsItems(items) {
 /**
  * 高速経路を試し、空振り（失敗・0件）なら従来の取得処理を実行する。
  * 「追加」なので、どちらも失敗したときの振る舞いは今までどおり。
+ *
+ * keepEmpty: true のとき「上流に到達したが0件」の結果（空のitems）をそのまま返す。
+ * 0件（＝上流に届いた）と失敗（＝届かなかった）を呼び出し側で区別でき、
+ * 届いていないのに従来経路まで繋げて何秒も待たせなくなる。
  */
-async function fastMeta(name, attempt, fallback, { timeout = 3500 } = {}) {
+async function fastMeta(name, attempt, fallback, { timeout = 3500, keepEmpty = false } = {}) {
   if (!YT_META_ENABLED) return fallback();
   let timer;
   const budget = new Promise((_, reject) => {
@@ -491,6 +500,10 @@ async function fastMeta(name, attempt, fallback, { timeout = 3500 } = {}) {
     if (out && (!Array.isArray(out.items) || out.items.length > 0)) {
       rememberAvatars(out.items || (out.video ? [out.video] : []));
       fillAvatars(out.items);
+      return out;
+    }
+    if (keepEmpty && out) {
+      rememberAvatars(out.items || (out.video ? [out.video] : []));
       return out;
     }
     throw new Error(`${name} fast-path empty`);
@@ -632,28 +645,42 @@ app.get("/api/search", async (req, res, next) => {
   const sp = buildSearchParams(filters);
   const wanted = !!(filters.uploadDate || filters.type || filters.duration || filters.sort !== "relevance");
 
+  // 検索全体に使える時間予算。再挑戦が何段になっても、これ以上は待たせない
+  // （旧実装は 1段3.5秒 × 最大3段 + 従来経路4秒 ≒ 最長14秒待ちだった）。
+  const BUDGET = Math.max(1000, parseInt(process.env.YT_SEARCH_BUDGET, 10) || 6000);
+  const ATTEMPT = Math.max(300, parseInt(process.env.YT_SEARCH_TIMEOUT, 10) || 3000);
+  const startedAt = Date.now();
+  const remaining = () => Math.max(0, BUDGET - (Date.now() - startedAt));
+
+  const MIN_ITEMS = 8;
+  const reply = (items, extra = {}) =>
+    res.json({ items, filters, filterApplied: !!sp, ...extra });
+
   try {
     // 高速経路: search 1往復（キャッシュ済みなら0往復）。従来は公開ページのスクレイピング。
+    // keepEmpty で「上流に到達して0件」と「到達できず」を区別する。
+    // （YT_META を無効にしている場合はそもそも試していないので「到達不可」としない）
     const fast = await fastMeta(
       "search",
       () => ytMeta.search(query, { page, sp: sp || undefined }),
-      () => null
+      () => null,
+      { timeout: Math.min(ATTEMPT, remaining()), keepEmpty: true }
     );
-    const MIN_ITEMS = 8;
-    const reply = (items, extra = {}) =>
-      res.json({ items, filters, filterApplied: !!sp, ...extra });
+    let fastFailed = fast === null && YT_META_ENABLED;
 
     let items = (fast && fast.items) || [];
     let source = items.length ? "innertube" : "none";
 
     // 絞り込みで0件なら、絞り込みなしでもう一度だけ試す。
     // sp の値が YouTube 側で変わっても「何も出ない」よりはマシ。
-    if (!items.length && wanted && sp) {
+    if (!items.length && wanted && sp && remaining() > 800) {
       const plain = await fastMeta(
         "search",
         () => ytMeta.search(query, { page }),
-        () => null
+        () => null,
+        { timeout: Math.min(ATTEMPT, remaining()), keepEmpty: true }
       );
+      fastFailed = plain === null && YT_META_ENABLED;
       if (plain && plain.items && plain.items.length) {
         return reply(plain.items, {
           source: "innertube",
@@ -665,22 +692,28 @@ app.get("/api/search", async (req, res, next) => {
 
     // プロキシが死んでいただけ（YouTube本体には拒否されていない）なら、
     // プールが次のプロキシに回るので一度だけ再挑戦する。
-    if (!items.length && YT_META_ENABLED && ytMeta && !ytMeta.isBlocked && ytMeta.state().transportFailures > 0) {
+    // 上流に到達して0件だった場合は無駄なので再挑戦しない。
+    if (fastFailed && !items.length && YT_META_ENABLED && ytMeta && !ytMeta.isBlocked && ytMeta.state().transportFailures > 0 && remaining() > 800) {
       const retry = await fastMeta(
         "search",
         () => ytMeta.search(query, { page, sp: sp || undefined }),
-        () => null
+        () => null,
+        { timeout: Math.min(ATTEMPT, remaining()), keepEmpty: true }
       );
       if (retry && retry.items && retry.items.length) {
         items = retry.items;
         source = "innertube-retry";
+      } else {
+        fastFailed = retry === null && YT_META_ENABLED;
       }
     }
 
-    // それでも少なければ従来経路で補う（ブロック環境では呼ばれない）。
+    // 上流に到達できていて（＝直接アクセスも有望）結果が少なければ従来経路で補う。
+    // 到達できていない（fastFailed）ときは従来経路も同じ相手に届かないだけなので呼ばない
+    // （旧実装はここで4秒待って常に0件を返していた）。
     // 従来経路は絞り込みに対応していないので、その旨を返す（UIで告知するため）。
-    if (items.length < MIN_ITEMS) {
-      const extra = await legacySearch(query, 20, page);
+    if (!fastFailed && items.length < MIN_ITEMS && remaining() > 300) {
+      const extra = await legacySearch(query, 20, page, remaining());
       if (extra.length) {
         const merged = mergeItems(items, extra);
         source = items.length ? "mixed" : "legacy";
@@ -3280,4 +3313,11 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-server.listen(port, '0.0.0.0', () => console.log(`Server is running on port ${port}`));
+// 直接起動（node index.js / Procfile / Render / Railway）のときだけ listen。
+// Vercel 等（@vercel/node）では下の module.exports がハンドラとして使われる。
+if (require.main === module) {
+  server.listen(port, '0.0.0.0', () => console.log(`Server is running on port ${port}`));
+}
+
+// Vercel 等（@vercel/node）: Express アプリをそのままハンドラとして渡す
+module.exports = app;

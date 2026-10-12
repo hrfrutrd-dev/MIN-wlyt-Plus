@@ -1726,6 +1726,19 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       return card;
     }
 
+    /**
+     * ショート判定。
+     * 高速経路（InnerTube）は type: 'short' を付ける。
+     * 従来・ストリーム経路はタイトルの先頭に '#' を付けてShortsを表す（このアプリの既定）。
+     * 旧実装は '#' だけを見ていたため、type 付きショートがショート欄に入らず、
+     * 逆に '#' を含む通常動画（例:「#1 人気曲」）がショートと誤認されていた。
+     */
+    function isShortItem(item) {
+      if (!item) return false;
+      if (item.type === 'short') return true;
+      return String(item.title || '').includes('#');
+    }
+
     async function loadContent(query = 'trending', page = 0) {
       if (isFetching) return;
       isFetching = true;
@@ -1749,7 +1762,10 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         filterNote = (items && items.filterNote) || '';
         items = normalizeAndFilterList(items);
 
-        if (page === 0) {
+        // トレンド画面だけ「件数が少ないときは別カテゴリで補う」。
+        // 明示的な検索では補わない（旧実装は検索結果が12件未満だと別カテゴリの
+        // 動画を混ぜてシャッフルしていた＝「検索結果が検索語と合わない」の主因）。
+        if (page === 0 && query === 'trending') {
           const MIN_ITEMS = 12;
           if (items.length < MIN_ITEMS) {
             const chips = Array.from(document.querySelectorAll('.chip'))
@@ -1792,8 +1808,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         const normals = [];
         items.forEach(item => {
           if (!item || !item.id) return;
-          const title = item.title || '';
-          if (title.includes('#')) shorts.push(item);
+          if (isShortItem(item)) shorts.push(item);
           else normals.push(item);
         });
 
@@ -1801,20 +1816,22 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           if (currentQuery !== 'trending' && shorts.length > 0 && shorts.length <= 4) {
             const needed = 6;
             const addedShortIds = new Set(shorts.map(s => s.id));
-            for (let p = 1; p <= 3 && shorts.length < needed; p++) {
-              const ep = searchEndpoint(currentQuery, p);
-              try {
-                const resItems = await fetchEndpoint(ep);
-                const norm = normalizeAndFilterList(resItems);
-                for (const it of norm) {
-                  if (!it || !it.id || addedShortIds.has(it.id)) continue;
-                  if ((it.title || '').includes('#')) {
-                    shorts.push(it);
-                    addedShortIds.add(it.id);
-                    if (shorts.length >= needed) break;
-                  }
+            // 続きのページは並列で取る（旧実装は最大3ページを「逐次 await」していて、
+            // 遅い環境だと描画前に最大3往復分だけ画面が固まっていた）
+            const morePages = await Promise.all(
+              [1, 2, 3].map(p => fetchEndpoint(searchEndpoint(currentQuery, p)))
+            );
+            for (const resItems of morePages) {
+              if (shorts.length >= needed) break;
+              const norm = normalizeAndFilterList(resItems);
+              for (const it of norm) {
+                if (!it || !it.id || addedShortIds.has(it.id)) continue;
+                if (isShortItem(it)) {
+                  shorts.push(it);
+                  addedShortIds.add(it.id);
+                  if (shorts.length >= needed) break;
                 }
-              } catch (e) {}
+              }
             }
           }
 
@@ -2228,7 +2245,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         const shorts = [], normals = [];
         items.forEach(item => {
           if (!item || !item.id) return;
-          if ((item.title || '').includes('#')) shorts.push(item);
+          if (isShortItem(item)) shorts.push(item);
           else normals.push(item);
         });
 
