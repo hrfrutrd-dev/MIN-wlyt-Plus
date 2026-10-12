@@ -5179,7 +5179,7 @@ statusAreaContainer.appendChild(viewToggleContainer);
             return tabSearchIds[searchTabId] !== searchId || activeTabId !== searchTabId;
         };
         
-        const randomLoadTime = (Math.random() * 2 + 0.5).toFixed(2);
+        const randomLoadTime = "0.04";
         
         currentTabData.lastSearchQuery = q.trim();
         currentTabData.lastSearchTime = Date.now();
@@ -5211,7 +5211,7 @@ content.innerHTML = `
             elapsedInterval = setInterval(() => {
                 const elapsedSeconds = (Date.now() - startTime) / 1000;
                 elapsedSpan.textContent = elapsedSeconds.toFixed(2);
-            }, 10);
+            }, 120);
         }
 
         await new Promise(resolve => setTimeout(resolve, parseFloat(randomLoadTime) * 1000));

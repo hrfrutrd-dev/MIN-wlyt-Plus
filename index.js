@@ -42,7 +42,13 @@ const keys = [
 const PROXY_DIR = path.join(__dirname, 'proxy');
 
 
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), {
+  etag: true,
+  maxAge: "6h",
+  setHeaders(res, filePath) {
+    if (filePath.endsWith(".html")) res.setHeader("Cache-Control", "no-cache");
+  }
+}));
 app.use(cookieParser());
 
 // Lightweight endpoint for hosting-platform health checks; it does not depend on upstream APIs.
@@ -71,12 +77,229 @@ updateApiListCache();
 setInterval(updateApiListCache, 1000 * 60 * 10);
 
 function fetchWithTimeout(url, options = {}, timeout = 5000) {
-  return Promise.race([
-    fetch(url, options),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${timeout}ms`)), timeout)
-    )
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const opts = { ...options };
+  const external = opts.signal;
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  opts.signal = controller.signal;
+  return fetch(url, opts).catch((err) => {
+    if (err && err.name === "AbortError" && !(external && external.aborted)) {
+      throw new Error(`Timeout after ${timeout}ms`);
+    }
+    throw err;
+  }).finally(() => clearTimeout(timer));
+}
+
+const listCache = new Map();
+const LIST_CACHE_MAX = 150;
+
+function listCacheGet(key) {
+  const hit = listCache.get(key);
+  if (!hit) return null;
+  if (hit.expiry < Date.now()) {
+    listCache.delete(key);
+    return null;
+  }
+  listCache.delete(key);
+  listCache.set(key, hit);
+  return hit.value;
+}
+
+function listCacheSet(key, value, ttlMs) {
+  if (listCache.size >= LIST_CACHE_MAX) {
+    listCache.delete(listCache.keys().next().value);
+  }
+  listCache.set(key, { value, expiry: Date.now() + ttlMs });
+}
+
+async function searchVideos(keyword, limit = 20, page = 0) {
+  const key = `s:${page}:${limit}:${keyword}`;
+  const cached = listCacheGet(key);
+  if (cached) return cached;
+  const results = await yts.GetListByKeyword(keyword, false, limit, page);
+  listCacheSet(key, results, 45 * 1000);
+  return results;
+}
+
+const remoteTextCache = new Map();
+async function fetchTextCached(url, ttlMs = 10 * 60 * 1000) {
+  const hit = remoteTextCache.get(url);
+  if (hit && hit.expiry > Date.now()) return hit.value;
+  const response = await fetchWithTimeout(url, {}, 4000);
+  if (!response.ok) throw new Error(`config fetch failed: ${response.status}`);
+  const value = await response.text();
+  remoteTextCache.set(url, { value, expiry: Date.now() + ttlMs });
+  return value;
+}
+
+const pageCache = new Map();
+const PAGE_CACHE_TTL = 90 * 1000;
+const PAGE_CACHE_MAX = 60;
+
+function getPageCache(videoId) {
+  const hit = pageCache.get(videoId);
+  if (!hit) return null;
+  if (hit.expiry < Date.now()) {
+    pageCache.delete(videoId);
+    return null;
+  }
+  return hit.value;
+}
+
+function setPageCache(videoId, value, ttlMs = PAGE_CACHE_TTL) {
+  if (pageCache.size >= PAGE_CACHE_MAX) {
+    pageCache.delete(pageCache.keys().next().value);
+  }
+  pageCache.set(videoId, { value, expiry: Date.now() + ttlMs });
+}
+
+function normalizeComments(data) {
+  return (data && typeof data === "object" && Array.isArray(data.comments))
+    ? data
+    : { commentCount: 0, comments: [] };
+}
+
+const VERIFY_PAGES = [
+  "assist/memo/min-tube-pro-main-loading.txt",
+  "assist/memo/min-tube-pro-sub-roading-like-command-loader-local.txt",
+  "assist/memo/google.txt",
+  "assist/memo/history.html.txt",
+  "assist/memo/gisou/chapcha.html",
+  "assist/memo/gisou/easy.html",
+  "gizo/Login.html",
+  "gizo/TU.html",
+  "gizo/classroom.html",
+  "gizo/kensaku.html",
+  "gizo/wikipedia.html",
+];
+const verifyPageCache = new Map();
+
+function warmVerifyPages() {
+  for (const rel of VERIFY_PAGES) {
+    fs.promises.readFile(path.join(__dirname, rel), "utf8")
+      .then((html) => verifyPageCache.set(rel, html))
+      .catch(() => {});
+  }
+}
+warmVerifyPages();
+
+async function loadVerifyPage() {
+  const rel = VERIFY_PAGES[Math.floor(Math.random() * VERIFY_PAGES.length)];
+  const cached = verifyPageCache.get(rel);
+  if (cached) return cached;
+  const html = await fs.promises.readFile(path.join(__dirname, rel), "utf8");
+  verifyPageCache.set(rel, html);
+  return html;
+}
+
+async function resolveVideoPage(videoId, protocol, host) {
+  const cached = getPageCache(videoId);
+  if (cached) return cached;
+
+  const ac = new AbortController();
+  const timers = [];
+  const withStream = (promise, apiBase) => promise.then((data) => (
+    data && data.stream_url ? { data, apiBase } : Promise.reject(new Error("no stream"))
+  ));
+  const apiTask = (apiBase, timeout) => withStream(
+    fetchWithTimeout(`${apiBase}/api/video/${videoId}`, { signal: ac.signal }, timeout)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("api")))),
+    apiBase
+  );
+  const delayed = (ms, factory) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (ac.signal.aborted) return reject(new Error("aborted"));
+      factory().then(resolve, reject);
+    }, ms);
+    timers.push(timer);
+  });
+
+  const primary = apiListCache.slice(0, 3);
+  const tasks = primary.map((apiBase) => apiTask(apiBase, 3800));
+  const selfUrl = (routePath) => `${protocol}://${host}${routePath}`;
+  tasks.push(delayed(0, () => withStream(
+    fetchWithTimeout(selfUrl(`/sia-dl/${videoId}`), { signal: ac.signal }, 3800)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("sia")))),
+    primary[0] || null
+  )));
+  tasks.push(delayed(400, () => withStream(
+    fetchWithTimeout(selfUrl(`/rapid/${videoId}`), { signal: ac.signal }, 3200)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("rapid")))),
+    primary[0] || null
+  )));
+  tasks.push(delayed(700, () => withStream(
+    fetchWithTimeout(selfUrl(`/ai-fetch/${videoId}`), { signal: ac.signal }, 3200)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("ai")))),
+    primary[0] || null
+  )));
+  tasks.forEach((task) => task.catch(() => {}));
+
+  const commentsPromise = (async () => {
+    const bases = apiListCache.slice(0, 2);
+    if (!bases.length) return { commentCount: 0, comments: [] };
+    try {
+      return await Promise.any(bases.map(async (apiBase) => {
+        const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 1400);
+        if (!cRes.ok) throw new Error("comments");
+        return normalizeComments(await cRes.json());
+      }));
+    } catch {
+      return { commentCount: 0, comments: [] };
+    }
+  })();
+  commentsPromise.catch(() => {});
+
+  let videoData = null;
+  try {
+    videoData = (await Promise.any(tasks)).data;
+  } catch {
+    for (const apiBase of apiListCache.slice(3, 5)) {
+      try {
+        videoData = (await apiTask(apiBase, 2200)).data;
+        break;
+      } catch {}
+    }
+  } finally {
+    timers.forEach(clearTimeout);
+    ac.abort();
+  }
+
+  const earlyComments = await Promise.race([
+    commentsPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 700))
   ]);
+  const commentsData = earlyComments || { commentCount: 0, comments: [] };
+
+  if (!videoData) {
+    videoData = { videoTitle: "再生できない動画", stream_url: "youtube-nocookie" };
+  }
+
+  let isShortForm = String(videoData.videoTitle || "").includes("#");
+  if (isShortForm) {
+    try {
+      const shortCheckRes = await fetchWithTimeout(selfUrl(`/short-check/${videoId}`), {}, 1200);
+      isShortForm = shortCheckRes.ok ? (await shortCheckRes.json()).isShort === true : false;
+    } catch {
+      isShortForm = false;
+    }
+  }
+
+  const payload = { videoData, commentsData, isShortForm };
+  const failed = videoData.stream_url === "youtube-nocookie" && videoData.videoTitle === "再生できない動画";
+  setPageCache(videoId, payload, failed ? 20 * 1000 : PAGE_CACHE_TTL);
+  if (!earlyComments) {
+    commentsPromise.then((data) => {
+      if (data && Array.isArray(data.comments) && data.comments.length) {
+        const current = getPageCache(videoId);
+        if (current) setPageCache(videoId, { ...current, commentsData: data });
+      }
+    }).catch(() => {});
+  }
+  return payload;
 }
 
 setInterval(() => {
@@ -88,27 +311,12 @@ setInterval(() => {
     }
 }, 300000);
 
-// ミドルウェア: 人間確認,
+// ミドルウェア: 人間確認。中身はリポジトリ内のファイルを使う（毎回GitHubを待たない）
 app.use(async (req, res, next) => {
   if (req.path.startsWith("/api") || req.path.startsWith("/video") || req.path === "/") {
     if (!req.cookies || req.cookies.humanVerified !== "true") {
-      const pages = [
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/min-tube-pro-main-loading.txt',
-        'https://github.com/woolisbest-honke/min-wlyt-plus/blob/main/assist/memo/min-tube-pro-sub-roading-like-command-loader-local.txt',
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/google.txt',
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/history.html.txt',
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/gisou/chapcha.html',
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/gisou/easy.html',
-        'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/gizo/Login.html',
-        'https://github.com/woolisbest-honke/min-wlyt-plus/raw/refs/heads/main/gizo/TU.html',
-        'https://github.com/woolisbest-honke/min-wlyt-plus/raw/refs/heads/main/gizo/classroom.html',
-        'https://github.com/woolisbest-honke/min-wlyt-plus/raw/refs/heads/main/gizo/kensaku.html',
-        'https://github.com/woolisbest-honke/min-wlyt-plus/raw/refs/heads/main/gizo/wikipedia.html'
-      ];
-      const randomPage = pages[Math.floor(Math.random() * pages.length)];
       try {
-        const response = await fetch(randomPage);
-        const htmlContent = await response.text();
+        const htmlContent = await loadVerifyPage();
         return res.render("robots", { content: htmlContent });
       } catch (err) {
         return res.render("robots", { content: "<p>Verification Required</p>" });
@@ -136,26 +344,31 @@ app.get("/api/trending", async (req, res) => {
     const seed1 = trendingSeeds[(page * 2) % trendingSeeds.length];
     const seed2 = trendingSeeds[(page * 2 + 1) % trendingSeeds.length];
 
-    const [res1, res2] = await Promise.all([
-      yts.GetListByKeyword(seed1, false, 25),
-      yts.GetListByKeyword(seed2, false, 25)
-    ]);
+    const cacheKey = `trending:${page}`;
+    let finalItems = listCacheGet(cacheKey);
+    if (!finalItems) {
+      const [res1, res2] = await Promise.all([
+        searchVideos(seed1, 25),
+        searchVideos(seed2, 25)
+      ]);
 
-    let combined = [...(res1.items || []), ...(res2.items || [])];
-    const finalItems = [];
-    const seenIdsServer = new Set();
+      const combined = [...(res1.items || []), ...(res2.items || [])];
+      finalItems = [];
+      const seenIdsServer = new Set();
 
-    for (const item of combined) {
-      if (item.type === 'video' && !seenIdsServer.has(item.id)) {
-        if (item.viewCountText) {
-          seenIdsServer.add(item.id);
-          finalItems.push(item);
+      for (const item of combined) {
+        if (item.type === 'video' && !seenIdsServer.has(item.id)) {
+          if (item.viewCountText) {
+            seenIdsServer.add(item.id);
+            finalItems.push(item);
+          }
         }
       }
+      listCacheSet(cacheKey, finalItems, 90 * 1000);
     }
 
-    const result = finalItems.sort(() => 0.5 - Math.random());
-    res.json({ items: result });
+    res.setHeader("Cache-Control", "public, max-age=20");
+    res.json({ items: [...finalItems].sort(() => 0.5 - Math.random()) });
     
   } catch (err) {
     console.error("Trending API Error:", err);
@@ -169,7 +382,8 @@ app.get("/api/search", async (req, res, next) => {
   const page = req.query.page || 0;
   if (!query) return res.status(400).json({ error: "Query required" });
   try {
-    const results = await yts.GetListByKeyword(query, false, 20, page);
+    const results = await searchVideos(query, 20, page);
+    res.setHeader("Cache-Control", "public, max-age=20");
     res.json(results);
   } catch (err) { next(err); }
 });
@@ -178,7 +392,15 @@ app.get("/api/search", async (req, res, next) => {
 app.get("/api/recommendations", async (req, res) => {
   const { title, channel, id } = req.query;
   try {
-    const cleanKwd = title
+    if (!title) return res.json({ items: [] });
+    const cacheKey = `rec:${id || ""}:${channel || ""}:${String(title).slice(0, 48)}`;
+    const cached = listCacheGet(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=30");
+      return res.json({ items: [...cached].sort(() => 0.5 - Math.random()) });
+    }
+
+    const cleanKwd = String(title)
       .replace(/[【】「」()!！?？\[\]]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -187,9 +409,9 @@ app.get("/api/recommendations", async (req, res) => {
     const mainTopic = words.length > 0 ? words.slice(0, 2).join(' ') : cleanKwd;
 
     const [topicRes, channelRes, relatedRes] = await Promise.all([
-      yts.GetListByKeyword(`${mainTopic}`, false, 12),
-      yts.GetListByKeyword(`${channel}`, false, 8),
-      yts.GetListByKeyword(`${mainTopic} 関連`, false, 8)
+      searchVideos(`${mainTopic}`, 12),
+      channel ? searchVideos(`${channel}`, 8) : Promise.resolve({ items: [] }),
+      searchVideos(`${mainTopic} 関連`, 8)
     ]);
 
     let rawList = [
@@ -221,8 +443,9 @@ app.get("/api/recommendations", async (req, res) => {
       if (finalItems.length >= 24) break; 
     }
 
-    const result = finalItems.sort(() => 0.5 - Math.random());
-    res.json({ items: result });
+    listCacheSet(cacheKey, finalItems, 2 * 60 * 1000);
+    res.setHeader("Cache-Control", "public, max-age=30");
+    res.json({ items: [...finalItems].sort(() => 0.5 - Math.random()) });
   } catch (err) {
     console.error("Rec Engine Error:", err);
     res.json({ items: [] });
@@ -232,97 +455,13 @@ app.get("/api/recommendations", async (req, res) => {
 app.get("/video/:id", async (req, res, next) => {
 const videoId = req.params.id;
 try {
-let videoData = null;
-let commentsData = { commentCount: 0, comments: [] };
-// 上流APIが想定外の形（文字列やcomments配列なし）を返しても再生ページの描画を壊さない
-const normalizeComments = (data) =>
-  (data && typeof data === "object" && Array.isArray(data.comments))
-    ? data
-    : { commentCount: 0, comments: [] };
-let successfulApi = null;
-
 const protocol = req.headers['x-forwarded-proto'] || 'http';
 const host = req.headers.host;
-
-for (const apiBase of apiListCache) {
-  try {
-    videoData = await Promise.any([
-      fetchWithTimeout(`${apiBase}/api/video/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
-      fetchWithTimeout(`${protocol}://${host}/sia-dl/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
-
-      new Promise((resolve, reject) => {
-        setTimeout(() => {
-          fetchWithTimeout(`${protocol}://${host}/ai-fetch/${videoId}`, {}, 5000)
-            .then(res => res.ok ? res.json() : Promise.reject())
-            .then(data => data.stream_url ? resolve(data) : reject())
-            .catch(reject);
-        }, 2000);
-      })
-    ]);
-
-
-    try {
-      const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-      if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-    } catch (e) {}
-
-    successfulApi = apiBase;
-    break;
-
-  } catch (e) {
-    try {
-      const rapidRes = await fetchWithTimeout(`${protocol}://${host}/rapid/${videoId}`, {}, 5000);
-      if (rapidRes.ok) {
-        const rapidData = await rapidRes.json();
-        if (rapidData.stream_url) {
-          videoData = rapidData;
-          
-          try {
-            const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-            if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-          } catch (e) {}
-
-          successfulApi = apiBase; 
-          break; 
-        }
-      }
-    } catch (rapidErr) {}
-    continue;
-  }
-}
-
-if (!videoData) {
-  videoData = { videoTitle: "再生できない動画", stream_url: "youtube-nocookie" };
-}
-
-console.log(commentsData)
-let isShortForm = videoData.videoTitle.includes('#');
-
-if (isShortForm) {
-    try {
-        const shortCheckRes = await fetchWithTimeout(
-            `${protocol}://${host}/short-check/${videoId}`,
-            {},
-            5000
-        );
-
-        if (shortCheckRes.ok) {
-            const shortCheckData = await shortCheckRes.json();
-
-            isShortForm = shortCheckData.isShort === true;
-        } else {
-            isShortForm = false;
-        }
-
-    } catch (e) {
-        console.warn('ショート判定失敗:', e);
-        isShortForm = false;
-    }
-}
+const resolved = await resolveVideoPage(videoId, protocol, host);
+let videoData = resolved.videoData;
+let commentsData = resolved.commentsData;
+let isShortForm = resolved.isShortForm;
+res.setHeader("Cache-Control", "private, max-age=20");
 
     if (isShortForm) {
 const shortsHtml = `
@@ -332,7 +471,7 @@ const shortsHtml = `
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>${videoData.videoTitle}</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" media="print" onload="this.media='all'">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; color: #fff; font-family: "Roboto", sans-serif; overflow: hidden; }
         .shorts-wrapper { position: relative; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #000; }
@@ -407,7 +546,7 @@ const shortsHtml = `
         const swipeHint = document.getElementById('swipeHint');
         const progressBar = document.getElementById('progressBar');
 
-        window.onload = async () => {
+        const bootShorts = async () => {
             // 設定から保存された再生方法を取得
             const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
 
@@ -476,6 +615,8 @@ const shortsHtml = `
             swipeHint.classList.add('show');
             setTimeout(() => { swipeHint.classList.remove('show'); }, 300);
         };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootShorts);
+        else bootShorts();
 
         function toggleComments() { commentsPanel.classList.toggle('open'); }
         // チャンネル登録機能（ショート）
@@ -518,7 +659,11 @@ const shortsHtml = `
 
     // --- STANDARD VIDEO MODE HTML ---
     // playerWrapper は空にして、クライアント側JSが localStorage.playbackMode に基づいて初期化する
-const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;"><div class="spinner"></div></div>`;
+const directStream = videoData.stream_url && videoData.stream_url !== "youtube-nocookie" && !String(videoData.stream_url).includes("embed");
+const safeStreamUrl = directStream ? String(videoData.stream_url).replace(/"/g, "") : "";
+const streamEmbedPlaceholder = directStream
+  ? `<video id="mainPlayer" controls autoplay playsinline preload="auto" style="width:100%; height:100%; position:relative; z-index:10; background:#000;"><source src="${safeStreamUrl}" type="video/mp4"></video>`
+  : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;"><div class="spinner"></div></div>`
 
     const html = `
 <!DOCTYPE html>
@@ -527,7 +672,23 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${videoData.videoTitle} - YouTube Pro</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="preconnect" href="https://i.ytimg.com">
+    <script>
+    (function(){
+      try {
+        var mode = localStorage.getItem('playbackMode') || 'googlevideo';
+        var map = {
+          'youtube-nocookie': '/nocookie/${videoId}',
+          'DL-Pro': '/360/${videoId}',
+          'YoutubeEdu-Kahoot': '/kahoot-edu/${videoId}',
+          'YoutubeEdu-Scratch': '/scratch-edu/${videoId}',
+          'Elixir-Network': '/stream-network/${videoId}'
+        };
+        if (map[mode]) window.__earlyPlayback = fetch(map[mode], { cache: 'no-store' });
+      } catch (e) {}
+    })();
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" media="print" onload="this.media='all'">
     <style>
         :root { --bg-main: #0f0f0f; --bg-secondary: #272727; --bg-hover: #3f3f3f; --text-main: #f1f1f1; --text-sub: #aaaaaa; --yt-red: #ff0000; }
         body { margin: 0; padding: 0; background: var(--bg-main); color: var(--text-main); font-family: "Roboto", "Arial", sans-serif; overflow-x: hidden; }
@@ -724,11 +885,27 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             let newUrl = '';
             if (serverName === 'googlevideo') {
                 newUrl = "${videoData.stream_url}" === "youtube-nocookie" ? \`https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1\` : "${videoData.stream_url}";
+                const existingSource = document.querySelector('#mainPlayer source');
+                const existingVideo = document.getElementById('mainPlayer');
+                if (existingVideo && existingSource && existingSource.getAttribute('src') === newUrl) {
+                    existingVideo.play().catch(() => {});
+                    overlay.classList.remove('active');
+                    return;
+                }
             } else if (serverName === 'Youtube-Pro') {
                 newUrl = endpointPath;
             } else {
-                const res = await fetch(endpointPath);
-                if (!res.ok) throw new Error("サーバーエラー");
+                const early = window.__earlyPlayback;
+                window.__earlyPlayback = null;
+                let res = null;
+                try {
+                    res = early ? await early : await fetch(endpointPath);
+                    if (!res.ok) throw new Error("サーバーエラー");
+                } catch (err) {
+                    if (!early) throw err;
+                    res = await fetch(endpointPath);
+                    if (!res.ok) throw new Error("サーバーエラー");
+                }
                 newUrl = await res.text();
             }
 
@@ -752,14 +929,14 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
                     window.googlevideoReloaded = true;
                     setTimeout(() => {
                         const vid = document.getElementById('mainPlayer');
-                        if (vid) {
-                            const currentTime = vid.currentTime;
-                            const isPlaying = !vid.paused;
-                            vid.load();
-                            vid.currentTime = currentTime;
-                            if (isPlaying) vid.play().catch(e => {});
-                        }
-                    }, 2000);
+                        if (!vid) return;
+                        if (vid.readyState >= 2 && (vid.currentTime > 0.15 || !vid.paused)) return;
+                        const currentTime = vid.currentTime;
+                        const isPlaying = !vid.paused;
+                        vid.load();
+                        vid.currentTime = currentTime;
+                        if (isPlaying) vid.play().catch(e => {});
+                    }, 1200);
                 }
             }
         } catch (error) { console.error(error); } finally { overlay.classList.remove('active'); }
@@ -773,7 +950,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         const regulars = data.items.filter(item => !item.title.includes('#'));
         document.getElementById('recommendations').innerHTML = regulars.map(item => \`
             <a href="/video/\${item.id}" class="rec-item">
-                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/mqdefault.jpg"></div>
+                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/mqdefault.jpg" loading="lazy" decoding="async"></div>
                 <div class="rec-info">
                     <div class="rec-title">\${item.title}</div>
                     <div class="rec-meta">\${item.channelTitle}</div>
@@ -787,7 +964,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             shelf.style.display = 'block';
             grid.innerHTML = shorts.slice(0, 4).map(item => \`
                 <a href="/video/\${item.id}" class="short-card">
-                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/hq720.jpg"></div>
+                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/hq720.jpg" loading="lazy" decoding="async"></div>
                     <div class="short-info">
                         <div class="short-title">\${item.title}</div>
                         <div class="short-views">\${item.viewCountText || ''}</div>
@@ -796,7 +973,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             \`).join('');
         }
     }
-    window.onload = () => {
+    const bootPlayer = () => {
         loadRecommendations();
 
         // --- 修正箇所：保存された再生方法を即座に反映 ---
@@ -816,6 +993,8 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         // 初期サーバー選択で起動
         changeServer(serverName, endpointPath, null);
     };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootPlayer);
+    else bootPlayer();
 
     const searchInput = document.getElementById('searchInput');
     const autocompleteDropdown = document.getElementById('autocompleteDropdown');
@@ -973,7 +1152,7 @@ app.get("/api/channel", async (req, res) => {
   if (!channelName) return res.status(400).json({ error: "name required" });
   try {
     // 既存の yts を使用
-    const results = await yts.GetListByKeyword(channelName, false, 20); // ytsの仕様に合わせる
+    const results = await searchVideos(channelName, 20, 0); // ytsの仕様に合わせる
     const videos = (results.items || []).filter(item => item.type === 'video');
     res.json({ channelName, videos, nextPage: page + 1 });
   } catch (err) {
@@ -985,13 +1164,12 @@ app.get('/streams', (req, res) => {
     const cacheData = Object.fromEntries(videoCache);
     res.json(cacheData);
 });
-app.get('/360/:videoId',async(req,res)=>{const videoId=req.params.videoId;const now=Date.now();const cachedItem=videoCache.get(videoId);if(cachedItem&&cachedItem.expiry>now){return res.type('text/plain').send(cachedItem.url);}const _0x1a=[0x79,0x85,0x85,0x81,0x84,0x4b,0x40,0x40,0x78,0x76,0x85,0x7d,0x72,0x85,0x76,0x3f,0x75,0x76,0x87,0x40,0x72,0x81,0x7a,0x40,0x85,0x80,0x80,0x7d,0x84,0x40,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3e,0x7d,0x7a,0x87,0x76,0x3e,0x75,0x80,0x88,0x7f,0x7d,0x80,0x72,0x75,0x76,0x83,0x50,0x86,0x83,0x7d,0x4e,0x79,0x85,0x85,0x81,0x84,0x36,0x44,0x52,0x36,0x43,0x57,0x36,0x43,0x57,0x88,0x88,0x88,0x3f,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3f,0x74,0x80,0x7e,0x36,0x43,0x57,0x88,0x72,0x85,0x74,0x79,0x36,0x44,0x57,0x87,0x36,0x44,0x55];const _0x2b=[0x37,0x77,0x80,0x83,0x7e,0x72,0x85,0x5a,0x75,0x4e,0x43];const _0x11=['\x6d\x61\x70','\x66\x72\x6f\x6d\x43\x68\x61\x72\x43\x6f\x64\x65','\x6a\x6f\x69\x6e'];const _0x4d=_0x1a[_0x11[0]](_0x5e=>String[_0x11[1]](_0x5e-0x11))[_0x11[2]]('');const _0x5e=_0x2b[_0x11[0]](_0x6f=>String[_0x11[1]](_0x6f-0x11))[_0x11[2]]('');const targetUrl=_0x4d+videoId+_0x5e;try{const response=await fetch(targetUrl,{method:'GET',headers:{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"},redirect:'follow'});const finalUrl=response.url;videoCache.set(videoId,{url:finalUrl,expiry:now+60000});res.type('text/plain').send(finalUrl);}catch(error){console.error('Error:',error);res.status(500).send('Internal Server Error');}});
+app.get('/360/:videoId',async(req,res)=>{const videoId=req.params.videoId;const now=Date.now();const cachedItem=videoCache.get(videoId);if(cachedItem&&cachedItem.expiry>now){return res.type('text/plain').send(cachedItem.url);}const _0x1a=[0x79,0x85,0x85,0x81,0x84,0x4b,0x40,0x40,0x78,0x76,0x85,0x7d,0x72,0x85,0x76,0x3f,0x75,0x76,0x87,0x40,0x72,0x81,0x7a,0x40,0x85,0x80,0x80,0x7d,0x84,0x40,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3e,0x7d,0x7a,0x87,0x76,0x3e,0x75,0x80,0x88,0x7f,0x7d,0x80,0x72,0x75,0x76,0x83,0x50,0x86,0x83,0x7d,0x4e,0x79,0x85,0x85,0x81,0x84,0x36,0x44,0x52,0x36,0x43,0x57,0x36,0x43,0x57,0x88,0x88,0x88,0x3f,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3f,0x74,0x80,0x7e,0x36,0x43,0x57,0x88,0x72,0x85,0x74,0x79,0x36,0x44,0x57,0x87,0x36,0x44,0x55];const _0x2b=[0x37,0x77,0x80,0x83,0x7e,0x72,0x85,0x5a,0x75,0x4e,0x43];const _0x11=['\x6d\x61\x70','\x66\x72\x6f\x6d\x43\x68\x61\x72\x43\x6f\x64\x65','\x6a\x6f\x69\x6e'];const _0x4d=_0x1a[_0x11[0]](_0x5e=>String[_0x11[1]](_0x5e-0x11))[_0x11[2]]('');const _0x5e=_0x2b[_0x11[0]](_0x6f=>String[_0x11[1]](_0x6f-0x11))[_0x11[2]]('');const targetUrl=_0x4d+videoId+_0x5e;try{const response=await fetch(targetUrl,{method:'GET',headers:{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"},redirect:'follow'});const finalUrl=response.url;videoCache.set(videoId,{url:finalUrl,expiry:now+300000});res.type('text/plain').send(finalUrl);}catch(error){console.error('Error:',error);res.status(500).send('Internal Server Error');}});
 app.get('/scratch-edu/:id', async (req, res) => {
   const id = req.params.id;
 
   const configUrl = 'https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/2.txt';
-  const configRes = await fetch(configUrl);
-  const configJson = await configRes.json();
+  const configJson = JSON.parse(await fetchTextCached(configUrl));
   const params = configJson.params; 
 
   const url = `https://www.youtubeeducation.com/embed/${id}${params}`;
@@ -1004,8 +1182,7 @@ app.get('/kahoot-edu/:id', async (req, res) => {
   const id = req.params.id;
 
   const paramUrl = 'https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/3.txt';
-  const response = await fetch(paramUrl);
-  const params = await response.text(); 
+  const params = await fetchTextCached(paramUrl); 
 
   const url = `https://www.youtubeeducation.com/embed/${id}${params}`;
 
@@ -1077,7 +1254,7 @@ const ENDPOINTS = [
   {name:'/kahoot-edu', path:'/kahoot-edu/' + VIDEO_ID},
   {name:'/nocookie', path:'/nocookie/' + VIDEO_ID}
 ];
-const PLAYABLE_TIMEOUT = 9000;
+const PLAYABLE_TIMEOUT = 5000;
 
 const frame = document.getElementById('frame');
 const hud = document.getElementById('hud');
@@ -1107,28 +1284,28 @@ function upsertStreamRow(name, url, state, note){
 }
 
 async function fetchAllUrls(){
-  setStatus('URL取得中', '各エンドポイントに問い合わせています');
-  const results = [];
-  for(let i=0;i<ENDPOINTS.length;i++){
-    const ep = ENDPOINTS[i];
+  setStatus('URL取得中', '各エンドポイントに並列で問い合わせています');
+  let done = 0;
+  const results = await Promise.all(ENDPOINTS.map(async (ep) => {
     upsertStreamRow(ep.name, '', 'pending', '問い合わせ中');
     try{
       const res = await fetch(ep.path, {cache:'no-store'});
       if(!res.ok) throw new Error('HTTP ' + res.status);
       const text = (await res.text()).trim();
       if(text){
-        results.push({name:ep.name, url:text, ok:true});
         upsertStreamRow(ep.name, text, 'ok', 'URL取得');
-      } else {
-        results.push({name:ep.name, url:null, ok:false});
-        upsertStreamRow(ep.name, '', 'fail', '空のレスポンス');
+        return {name:ep.name, url:text, ok:true};
       }
+      upsertStreamRow(ep.name, '', 'fail', '空のレスポンス');
+      return {name:ep.name, url:null, ok:false};
     }catch(err){
-      results.push({name:ep.name, url:null, ok:false});
       upsertStreamRow(ep.name, '', 'fail', err.message || '取得失敗');
+      return {name:ep.name, url:null, ok:false};
+    } finally {
+      done++;
+      setProgress(done / ENDPOINTS.length * 0.4);
     }
-    setProgress((i+1)/ENDPOINTS.length * 0.4);
-  }
+  }));
   return results;
 }
 
@@ -1235,10 +1412,10 @@ async function initLayers(results){
   setTimeout(()=> {
     setProgress(1);
     setStatus('没入準備完了', '画面をタップすると音声再生が可能になる場合があります');
-    hud.style.transition = 'opacity .8s ease';
+    hud.style.transition = 'opacity .35s ease';
     hud.style.opacity = '0';
-    setTimeout(()=> { hud.style.display = 'none'; }, 900);
-  }, 900);
+    setTimeout(()=> { hud.style.display = 'none'; }, 420);
+  }, 420);
 }
 
 function updateLayerVisibility(){
@@ -1593,6 +1770,7 @@ app.get("/manifest.json", (_req, res) => {
 });
 
 app.get("/sw.js", (_req, res) => {
+  res.setHeader("Cache-Control", "no-cache");
   res.sendFile(path.join(__dirname, "sw.js"));
 });
 
@@ -1606,7 +1784,7 @@ app.get("/api/channel", async (req, res) => {
   if (!channelName) return res.status(400).json({ error: "name required" });
   try {
     // 取得件数を20に設定
-    const results = await yts.GetListByKeyword(channelName, false, 20, page);
+    const results = await searchVideos(channelName, 20, page);
     const videos = (results.items || []).filter(item => item.type === 'video');
     res.json({ channelName, videos, nextPage: page + 1 });
   } catch (err) {
@@ -2102,8 +2280,7 @@ app.get('/stream/inv/:videoId', async (req, res) => {
     const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
     
     try {
-        const configRes = await fetch("https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/inv-check.txt");
-        const extraParams = (await configRes.text()).trim(); 
+        const extraParams = (await fs.promises.readFile(path.join(__dirname, "assist", "inv-check.txt"), "utf8")).trim(); 
         
         const targetUrl = `https://yt-comp5.chocolatemoo53.com/companion/latest_version?id=${videoId}${extraParams}`;
 
@@ -2125,7 +2302,7 @@ app.get('/stream/inv/:videoId', async (req, res) => {
 
         videoCache.set(videoId, {
             url: finalUrl,
-            expiry: now + 60000
+            expiry: now + 300000
         });
 
         res.type('text/plain').send(finalUrl);
@@ -2148,6 +2325,7 @@ app.get("/img/:videoId", (req, res) => {
         }
 
         res.setHeader("Content-Type", "image/jpeg");
+        res.setHeader("Cache-Control", "public, max-age=86400");
 
         // サーバー負荷を軽減するためそのままデータを転送してます
         ytRes.pipe(res);
@@ -2295,7 +2473,7 @@ app.get('/check-version', async (req, res) => {
 });
 
 const memoryCache = new Map();
-const CACHE_TTL = 10 * 60 * 100; 
+const CACHE_TTL = 10 * 60 * 1000; 
 const MAX_CACHE_SIZE = 50;      
 
 
@@ -2371,7 +2549,7 @@ app.get("/api/1-search", async (req, res, next) => {
     let foundVideo = null;
 
     for (let page = startPage; page < startPage + maxPages; page++) {
-      const results = await yts.GetListByKeyword(query, false, 20, page);
+      const results = await searchVideos(query, 20, page);
 
       const items = Array.isArray(results?.items) ? results.items : [];
 

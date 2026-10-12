@@ -9,6 +9,8 @@
 <link rel="manifest" href="/manifest.json" />
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://i3.ytimg.com">
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -669,6 +671,8 @@
       flex-shrink: 0;
       transition: transform 0.2s;
       position: relative;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 300px;
     }
     .short-card:hover { transform: scale(1.02); }
     .short-thumb {
@@ -705,6 +709,8 @@
     .video-card {
       cursor: pointer; text-decoration: none; color: inherit;
       display: flex; flex-direction: column;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 280px;
     }
     .thumb {
       width: 100%; aspect-ratio: 16/9;
@@ -1386,9 +1392,27 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
 
     let displayedIds = new Set();
     let isFetching = false;
+    let feedExhausted = false;
     let currentPage = 0;
     let currentQuery = 'trending';
     let shortsExpanded = true;
+
+    function attachDeferredAvatar(card, channel) {
+      const avatarEl = card.querySelector('.channel-avatar');
+      if (!avatarEl || avatarEl.querySelector('img')) return;
+      const run = () => {
+        if (!avatarEl.isConnected) return;
+        const img = document.createElement('img');
+        img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel || 'C')}&background=555&color=fff&size=64&bold=true`;
+        img.alt = channel || '';
+        img.decoding = 'async';
+        img.onload = () => img.classList.add('loaded');
+        img.onerror = () => img.remove();
+        avatarEl.appendChild(img);
+      };
+      if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1200 });
+      else setTimeout(run, 350);
+    }
 
     // Sidebar toggle
     document.getElementById('menuBtn').addEventListener('click', () => {
@@ -1459,6 +1483,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       if (isFetching) return;
       isFetching = true;
       loading.style.display = 'block';
+      const sizeBefore = displayedIds.size;
 
       if (page === 0) {
         displayedIds.clear();
@@ -1484,7 +1509,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               .map(c => c.dataset.q).filter(q => q && q !== query);
             shuffleArray(chips);
             const supplementPromises = [];
-            const maxSources = Math.min(4, chips.length);
+            const maxSources = Math.min(2, chips.length);
             for (let i = 0; i < maxSources; i++) {
               const cat = chips[i];
               const ep = cat === 'trending' ? `/api/trending?page=0` : `/api/search?q=${encodeURIComponent(cat)}&page=0`;
@@ -1518,52 +1543,50 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           else normals.push(item);
         });
 
-        if (page === 0) {
-          if (currentQuery !== 'trending' && shorts.length > 0 && shorts.length <= 4) {
-            const needed = 6;
-            const addedShortIds = new Set(shorts.map(s => s.id));
-            for (let p = 1; p <= 3 && shorts.length < needed; p++) {
-              const ep = `/api/search?q=${encodeURIComponent(currentQuery)}&page=${p}`;
-              try {
-                const resItems = await fetchEndpoint(ep);
-                const norm = normalizeAndFilterList(resItems);
-                for (const it of norm) {
-                  if (!it || !it.id || addedShortIds.has(it.id)) continue;
-                  if ((it.title || '').includes('#')) {
-                    shorts.push(it);
-                    addedShortIds.add(it.id);
-                    if (shorts.length >= needed) break;
-                  }
-                }
-              } catch (e) {}
-            }
+        const paintShorts = (list) => {
+          if (!list || list.length <= 4) {
+            if (shortsRow.children.length === 0) shortsSection.style.display = 'none';
+            return;
           }
-
-          if (shorts.length <= 4) {
-            shortsSection.style.display = 'none';
-          } else {
-            shortsSection.style.display = 'block';
-            shorts.forEach(item => {
-              if (!item || !item.id || displayedIds.has(item.id)) return;
-              displayedIds.add(item.id);
-              const a = document.createElement('a');
-              a.className = 'short-card';
-              a.href = `/video/${item.id}`;
-              const thumbUrl = getThumbUrl(item.id, 'hq');
-              const channel = item.channelTitle || '';
-              const viewText = item.viewCountText || '';
-              a.innerHTML = `
+          shortsSection.style.display = 'block';
+          list.forEach(item => {
+            if (!item || !item.id || displayedIds.has(item.id)) return;
+            displayedIds.add(item.id);
+            const a = document.createElement('a');
+            a.className = 'short-card';
+            a.href = `/video/${item.id}`;
+            const thumbUrl = getThumbUrl(item.id, 'hq');
+            const viewText = item.viewCountText || '';
+            a.innerHTML = `
                 <div class="short-thumb">
-                  <img src="${thumbUrl}" loading="lazy" alt="${item.title || 'ショート'}">
+                  <img src="${thumbUrl}" loading="lazy" decoding="async" alt="${item.title || 'ショート'}">
                   <div class="short-overlay">
                     <div class="short-title">${item.title || ''}</div>
                     <div class="short-views">${viewText}</div>
                   </div>
                 </div>
               `;
-              shortsRow.appendChild(a);
-            });
-            updateShortsToggleUI();
+            shortsRow.appendChild(a);
+          });
+          updateShortsToggleUI();
+        };
+
+        if (page === 0) {
+          paintShorts(shorts);
+          if (currentQuery !== 'trending' && shorts.length > 0 && shorts.length <= 4) {
+            const addedShortIds = new Set(shorts.map(s => s.id));
+            fetchEndpoint(`/api/search?q=${encodeURIComponent(currentQuery)}&page=1`).then((resItems) => {
+              const norm = normalizeAndFilterList(resItems);
+              for (const it of norm) {
+                if (!it || !it.id || addedShortIds.has(it.id)) continue;
+                if ((it.title || '').includes('#')) {
+                  shorts.push(it);
+                  addedShortIds.add(it.id);
+                  if (shorts.length >= 6) break;
+                }
+              }
+              paintShorts(shorts);
+            }).catch(() => {});
           }
         }
 
@@ -1602,22 +1625,15 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               <button class="card-menu-btn" aria-label="メニュー" data-id="${item.id}" data-title="${(item.title||'').replace(/"/g,'&quot;')}" data-channel="${channel.replace(/"/g,'&quot;')}" data-views="${viewText}" data-published="${published}">⋮</button>
             </div>
           `;
-          // アバター画像がない場合はui-avatarsから取得
-          if (!avatarUrl) {
-            const avatarEl = card.querySelector('.channel-avatar');
-            const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
-            img.alt = channel;
-            img.onload = () => img.classList.add('loaded');
-            img.onerror = () => img.remove();
-            avatarEl.appendChild(img);
-          }
+          if (!avatarUrl) attachDeferredAvatar(card, channel);
           videoGrid.appendChild(card);
         });
 
       } catch (err) {
         console.error("Fetch error", err);
       } finally {
+        if (page === 0) feedExhausted = false;
+        else if (displayedIds.size === sizeBefore) feedExhausted = true;
         isFetching = false;
         loading.style.display = 'none';
       }
@@ -1637,18 +1653,21 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       loadContent(q, 0);
     };
 
-    window.onscroll = () => {
-      const scrollPos = window.innerHeight + window.scrollY;
-      const threshold = document.documentElement.scrollHeight - 800;
-      if (scrollPos >= threshold && !isFetching) {
-        currentPage++;
-        if (isPersonalized) {
-          loadPersonalizedFeed(currentPage);
-        } else {
-          loadContent(currentQuery, currentPage);
+    let scrollTick = false;
+    window.addEventListener('scroll', () => {
+      if (scrollTick || isFetching || feedExhausted) return;
+      scrollTick = true;
+      requestAnimationFrame(() => {
+        scrollTick = false;
+        const scrollPos = window.innerHeight + window.scrollY;
+        const threshold = document.documentElement.scrollHeight - 500;
+        if (scrollPos >= threshold && !isFetching && !feedExhausted) {
+          currentPage++;
+          if (isPersonalized) loadPersonalizedFeed(currentPage);
+          else loadContent(currentQuery, currentPage);
         }
-      }
-    };
+      });
+    }, { passive: true });
 
     document.getElementById('chipsBar').onclick = (e) => {
       const chip = e.target.closest('.chip');
@@ -1916,6 +1935,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       if (isFetching) return;
       isFetching = true;
       loading.style.display = 'block';
+      const sizeBefore = displayedIds.size;
 
       if (page === 0) {
         displayedIds.clear();
@@ -1943,7 +1963,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       try {
         // ページに応じてキーワードをローテーション（無限スクロール対応）
         const shuffled = shuffleArray([...allKeywords]);
-        const pick = shuffled.slice((page % Math.max(shuffled.length, 1)) * 2, (page % Math.max(shuffled.length, 1)) * 2 + 3);
+        const pick = shuffled.slice((page % Math.max(shuffled.length, 1)) * 2, (page % Math.max(shuffled.length, 1)) * 2 + 2);
         const queries = pick.length > 0 ? pick : shuffled.slice(0, 3);
 
         const promises = queries.map(q => fetchEndpoint(`/api/search?q=${encodeURIComponent(q)}&page=${Math.floor(page / Math.max(queries.length, 1))}`));
@@ -2025,21 +2045,15 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               <button class="card-menu-btn" aria-label="メニュー" data-id="${item.id}" data-title="${(item.title||'').replace(/"/g,'&quot;')}" data-channel="${channel.replace(/"/g,'&quot;')}" data-views="${viewText}" data-published="${published}">⋮</button>
             </div>
           `;
-          if (!avatarUrl) {
-            const avatarEl = card.querySelector('.channel-avatar');
-            const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
-            img.alt = channel;
-            img.onload = () => img.classList.add('loaded');
-            img.onerror = () => img.remove();
-            avatarEl.appendChild(img);
-          }
+          if (!avatarUrl) attachDeferredAvatar(card, channel);
           videoGrid.appendChild(card);
         });
 
       } catch (err) {
         console.error('Personalized feed error', err);
       } finally {
+        if (page === 0) feedExhausted = false;
+        else if (displayedIds.size === sizeBefore) feedExhausted = true;
         isFetching = false;
         loading.style.display = 'none';
       }
@@ -2048,7 +2062,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     // パーソナライズモードかどうか
     let isPersonalized = true;
 
-    window.onload = () => {
+    function bootHome() {
       const params = new URLSearchParams(window.location.search);
       const q = params.get('q');
       if (q) {
@@ -2060,7 +2074,9 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         isPersonalized = true;
         loadPersonalizedFeed(0);
       }
-    };
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootHome);
+    else bootHome();
 
     // ===== LIBRARY: History / Liked / Playlists =====
     const LIB_HISTORY  = 'mt_history';
